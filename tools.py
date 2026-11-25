@@ -6,8 +6,28 @@ import subprocess
 import webbrowser
 from typing import Optional, List, Dict, Any
 
-# Current working directory default
-DEFAULT_WORKSPACE = os.path.abspath("C:/jarvis") if os.path.exists("C:/jarvis") else os.getcwd()
+import re
+
+# Current working directory default (configurable via FRIDAY_WORKSPACE)
+DEFAULT_WORKSPACE = os.path.abspath(os.getenv("FRIDAY_WORKSPACE") or os.getcwd())
+
+_BLOCKED_CMD_PATTERNS = [
+    re.compile(r"\bformat\s+[a-z]:", re.I),
+    re.compile(r"\brm\s+-rf\s+/", re.I),
+    re.compile(r"\bdel\s+/[sqf]+\s+[a-z]:\\", re.I),
+    re.compile(r"\bshutdown\b", re.I),
+    re.compile(r"\breg\s+delete\b", re.I),
+]
+
+def _resolve_safe_path(path: str) -> str:
+    """Resolves a path and enforces workspace boundary unless FRIDAY_ALLOW_OUTSIDE_WORKSPACE=1."""
+    base = os.path.abspath(DEFAULT_WORKSPACE)
+    candidate = path if os.path.isabs(path) else os.path.join(base, path)
+    resolved = os.path.abspath(candidate)
+    if os.getenv("FRIDAY_ALLOW_OUTSIDE_WORKSPACE") != "1":
+        if os.path.commonpath([base, resolved]) != base:
+            raise PermissionError(f"Access denied: '{path}' is outside workspace '{base}'.")
+    return resolved
 
 def run_command(command: str) -> str:
     """Executes a PowerShell or shell command on the host Windows machine and returns terminal output.
@@ -15,6 +35,9 @@ def run_command(command: str) -> str:
     Args:
         command: The shell command line to execute (e.g. 'git status', 'python --version', 'dir', 'npm test').
     """
+    for pat in _BLOCKED_CMD_PATTERNS:
+        if pat.search(command):
+            return f"Error: Command blocked by safety policy: '{command}'."
     print(f"\n⚡ [Tool Execution] Executing: {command}")
     try:
         res = subprocess.run(
@@ -51,7 +74,7 @@ def read_file(path: str, start_line: Optional[int] = None, end_line: Optional[in
     """
     print(f"\n📖 [Tool Execution] Reading file: {path}")
     try:
-        p = os.path.abspath(path)
+        p = _resolve_safe_path(path)
         if not os.path.exists(p):
             return f"Error: File '{path}' does not exist on disk."
         with open(p, "r", encoding="utf-8", errors="replace") as f:
@@ -77,7 +100,7 @@ def write_file(path: str, content: str) -> str:
     """
     print(f"\n✏️ [Tool Execution] Writing file: {path} ({len(content)} chars)")
     try:
-        p = os.path.abspath(path)
+        p = _resolve_safe_path(path)
         parent = os.path.dirname(p)
         if parent:
             os.makedirs(parent, exist_ok=True)
@@ -97,7 +120,7 @@ def edit_file(path: str, target: str, replacement: str) -> str:
     """
     print(f"\n🔧 [Tool Execution] Editing file: {path}")
     try:
-        p = os.path.abspath(path)
+        p = _resolve_safe_path(path)
         if not os.path.exists(p):
             return f"Error: File '{path}' does not exist."
         with open(p, "r", encoding="utf-8", errors="replace") as f:
@@ -120,7 +143,7 @@ def list_directory(path: Optional[str] = ".") -> str:
     target = path or "."
     print(f"\n📁 [Tool Execution] Listing directory: {target}")
     try:
-        p = os.path.abspath(target)
+        p = _resolve_safe_path(target)
         if not os.path.exists(p):
             return f"Error: Directory '{target}' does not exist."
         entries = sorted(os.listdir(p))
