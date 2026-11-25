@@ -29,13 +29,12 @@ socket.getaddrinfo = _ipv4_getaddrinfo
 
 # Load environment credentials
 ENV_PATHS = [
-    Path("C:/jarvis/.env"),
+    Path(".env"),
     Path(__file__).parent / ".env",
-    Path(".env")
 ]
 for p in ENV_PATHS:
     if p.exists():
-        load_dotenv(p, override=True)
+        load_dotenv(p, override=False)
         break
 
 from google import genai

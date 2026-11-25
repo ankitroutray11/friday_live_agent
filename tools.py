@@ -40,8 +40,13 @@ def run_command(command: str) -> str:
             return f"Error: Command blocked by safety policy: '{command}'."
     print(f"\n⚡ [Tool Execution] Executing: {command}")
     try:
+        shell_cmd = (
+            ["powershell", "-NoProfile", "-Command", command]
+            if sys.platform == "win32"
+            else ["sh", "-c", command]
+        )
         res = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", command],
+            shell_cmd,
             capture_output=True,
             text=True,
             timeout=30.0
