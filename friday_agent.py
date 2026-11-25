@@ -77,6 +77,14 @@ class FridayLiveVoiceAgent:
         self.interrupt_event = threading.Event()
         self.loop = None
         self.is_speaking = False
+        self._last_playback_time = 0.0
+        # Default to echo-safe half-duplex on speakers; set FRIDAY_FULL_DUPLEX=1 for headphones
+        self.full_duplex = os.getenv("FRIDAY_FULL_DUPLEX", "0") == "1"
+        self._echo_tail_seconds = float(os.getenv("FRIDAY_ECHO_TAIL_SEC", "0.4"))
+
+    def _is_playback_active(self) -> bool:
+        """Returns True while audio is playing or within the post-playback echo tail."""
+        return self.is_speaking or (time.monotonic() - self._last_playback_time) < self._echo_tail_seconds
 
     def _audio_playback_worker(self):
         """Dedicated thread playing incoming 24kHz PCM audio chunks to speakers with zero latency."""
@@ -92,12 +100,14 @@ class FridayLiveVoiceAgent:
                                 break
                         self.interrupt_event.clear()
                         self.is_speaking = False
+                        self._last_playback_time = 0.0
                     
                     try:
                         chunk = self.audio_out_queue.get(timeout=0.03)
                         if chunk and not self.interrupt_event.is_set():
                             self.is_speaking = True
                             stream.write(chunk)
+                            self._last_playback_time = time.monotonic()
                         else:
                             self.is_speaking = False
                     except queue.Empty:
@@ -110,6 +120,8 @@ class FridayLiveVoiceAgent:
         """Captures 16kHz raw PCM microphone audio and enqueues to async sender."""
         if not self.running.is_set():
             return
+        if not self.full_duplex and self._is_playback_active():
+            return
         if self.loop and self.loop.is_running():
             try:
                 self.loop.call_soon_threadsafe(self.audio_in_queue.put_nowait, bytes(indata))
@@ -121,6 +133,8 @@ class FridayLiveVoiceAgent:
         while self.running.is_set():
             try:
                 chunk = await self.audio_in_queue.get()
+                if not self.full_duplex and self._is_playback_active():
+                    continue
                 await session.send_realtime_input(
                     audio=types.Blob(data=chunk, mime_type="audio/pcm;rate=16000")
                 )
@@ -133,61 +147,62 @@ class FridayLiveVoiceAgent:
     async def _receive_loop(self, session):
         """Receives audio chunks, transcriptions, and executes autonomous tools."""
         try:
-            async for response in session.receive():
-                if not self.running.is_set():
-                    break
-                
-                server_content = response.server_content
-                if server_content:
-                    # User interrupted mid-generation
-                    if server_content.interrupted:
-                        print("\n⚡ [F.R.I.D.A.Y.]: (Interrupted)")
-                        self.interrupt_event.set()
+            while self.running.is_set():
+                async for response in session.receive():
+                    if not self.running.is_set():
+                        break
+                    
+                    server_content = response.server_content
+                    if server_content:
+                        # User interrupted mid-generation
+                        if server_content.interrupted:
+                            print("\n⚡ [F.R.I.D.A.Y.]: (Interrupted)")
+                            self.interrupt_event.set()
 
-                    # Spoken audio transcription from Friday
-                    if server_content.output_transcription and server_content.output_transcription.text:
-                        sys.stdout.write(f"\r✦ [F.R.I.D.A.Y.]: {server_content.output_transcription.text}\n")
-                        sys.stdout.flush()
+                        # Spoken audio transcription from Friday
+                        if server_content.output_transcription and server_content.output_transcription.text:
+                            sys.stdout.write(f"\r✦ [F.R.I.D.A.Y.]: {server_content.output_transcription.text}\n")
+                            sys.stdout.flush()
 
-                    # Input transcription from Boss (User)
-                    if server_content.input_transcription and server_content.input_transcription.text:
-                        sys.stdout.write(f"\r🎤 [Boss]: {server_content.input_transcription.text}\n")
-                        sys.stdout.flush()
+                        # Input transcription from Boss (User)
+                        if server_content.input_transcription and server_content.input_transcription.text:
+                            sys.stdout.write(f"\r🎤 [Boss]: {server_content.input_transcription.text}\n")
+                            sys.stdout.flush()
 
-                    # Queue audio playback to speakers
-                    if server_content.model_turn:
-                        for part in server_content.model_turn.parts:
-                            if part.inline_data and part.inline_data.data:
-                                self.audio_out_queue.put(part.inline_data.data)
+                        # Queue audio playback to speakers
+                        if server_content.model_turn:
+                            for part in server_content.model_turn.parts:
+                                if part.inline_data and part.inline_data.data:
+                                    self.audio_out_queue.put(part.inline_data.data)
 
-                # Autonomous Agent Tool Calling
-                if response.tool_call:
-                    for fc in response.tool_call.function_calls:
-                        tool_name = fc.name
-                        tool_args = fc.args or {}
-                        print(f"\n⚙️ [F.R.I.D.A.Y. Action]: Invoking {tool_name}({tool_args})")
-                        
-                        func = TOOL_MAP.get(tool_name)
-                        if func:
-                            try:
-                                # Run tool in worker thread to prevent blocking async audio loop
-                                result = await asyncio.to_thread(func, **tool_args)
-                            except Exception as err:
-                                result = f"Tool execution failed: {err}"
-                        else:
-                            result = f"Error: Tool '{tool_name}' is not recognized."
+                    # Autonomous Agent Tool Calling
+                    if response.tool_call:
+                        for fc in response.tool_call.function_calls:
+                            tool_name = fc.name
+                            tool_args = fc.args or {}
+                            print(f"\n⚙️ [F.R.I.D.A.Y. Action]: Invoking {tool_name}({tool_args})")
+                            
+                            func = TOOL_MAP.get(tool_name)
+                            if func:
+                                try:
+                                    # Run tool in worker thread to prevent blocking async audio loop
+                                    result = await asyncio.to_thread(func, **tool_args)
+                                except Exception as err:
+                                    result = f"Tool execution failed: {err}"
+                            else:
+                                result = f"Error: Tool '{tool_name}' is not recognized."
 
-                        # Send tool output back to Gemini Live
-                        await session.send_tool_response(
-                            function_responses=[
-                                types.FunctionResponse(
-                                    id=fc.id,
-                                    name=fc.name,
-                                    response={"result": str(result)}
-                                )
-                            ]
-                        )
-                        print(f"✓ [Action Completed]: Results delivered to neural stream.")
+                            # Send tool output back to Gemini Live
+                            await session.send_tool_response(
+                                function_responses=[
+                                    types.FunctionResponse(
+                                        id=fc.id,
+                                        name=fc.name,
+                                        response={"result": str(result)}
+                                    )
+                                ]
+                            )
+                            print(f"✓ [Action Completed]: Results delivered to neural stream.")
 
         except asyncio.CancelledError:
             pass
